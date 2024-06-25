@@ -190,6 +190,7 @@ public class ManifestFileMeta {
         List<ManifestFileMeta> candidates = new ArrayList<>();
         long totalSize = 0;
         // merge existing small manifest files
+        //将多个小文件合并 合并的新文件存储到 result 以及 newMetas 中
         for (ManifestFileMeta manifest : input) {
             totalSize += manifest.fileSize;
             candidates.add(manifest);
@@ -202,6 +203,7 @@ public class ManifestFileMeta {
         }
 
         // merge the last bit of manifests if there are too many
+        //suggestedMinMetaCount 默认值为 manifest.merge-min-count 30 个,如果数量大于这个值则进行合并
         if (candidates.size() >= suggestedMinMetaCount) {
             mergeCandidates(candidates, manifestFile, result, newMetas);
         } else {
@@ -238,7 +240,7 @@ public class ManifestFileMeta {
             RowType partitionType)
             throws Exception {
         // 1. should trigger full compaction
-
+        //筛选出初步符合条件的 base 文件，尽量减少文件的读写, 判断标准就是文件大于suggestedMetaSize(默认是8MB)，并且其中不包含被删除的目录
         List<ManifestFileMeta> base = new ArrayList<>();
         int totalManifestSize = 0;
         int i = 0;
@@ -255,6 +257,7 @@ public class ManifestFileMeta {
         List<ManifestFileMeta> delta = new ArrayList<>();
         long deltaDeleteFileNum = 0;
         long totalDeltaFileSize = 0;
+        // i 是继续上面逻辑的
         for (; i < inputs.size(); i++) {
             ManifestFileMeta file = inputs.get(i);
             delta.add(file);
@@ -262,7 +265,7 @@ public class ManifestFileMeta {
             deltaDeleteFileNum += file.numDeletedFiles();
             totalDeltaFileSize += file.fileSize();
         }
-
+        // 进行触发提交的判断 阈值默认为 16mb 配置参数为 manifest.full-compaction-threshold-size
         if (totalDeltaFileSize < sizeTrigger) {
             return Optional.empty();
         }
@@ -275,12 +278,16 @@ public class ManifestFileMeta {
                 totalManifestSize);
 
         // 2.1. try to skip base files by partition filter
-
+        // 收集 delta 中保存的 ManifestEntry ，FileEntry.mergeEntries 实现中会尽量合并 ManifestEntry，
+        // 比如一个 ManifestEntry 有 add 类型 后面又出现了 delete 类型 那么这条记录就可以被抵消
+        // 但是也存在另外一种情况 delta 保存的 只有 delete 类型，没有 add 类型，add 类型的记录其实是存储在前面的 base 文件中
         Map<Identifier, ManifestEntry> deltaMerged = new LinkedHashMap<>();
+        //多线程读取，速度取决于读取的线程数 使用的 ForkJoinPool 保证了先后顺序
         FileEntry.mergeEntries(manifestFile, delta, deltaMerged);
 
         List<ManifestFileMeta> result = new ArrayList<>();
         int j = 0;
+        //通过 partition 进行过滤，看看 deleteEntry 的分区信息是否存在于 base 存储的 manifest 中, 如果不涉及的直接添加到 result 集合中
         if (partitionType.getFieldCount() > 0) {
             Set<BinaryRow> deletePartitions = computeDeletePartitions(deltaMerged);
             Optional<Predicate> predicateOpt =
@@ -309,7 +316,7 @@ public class ManifestFileMeta {
         }
 
         // 2.2. try to skip base files by reading entries
-
+        // 收集 deltaMerged 中 delete 类型的 entry 文件标识 存放到 deleteEntries 用于后面的判断
         Set<Identifier> deleteEntries = new HashSet<>();
         deltaMerged.forEach(
                 (k, v) -> {
@@ -317,7 +324,7 @@ public class ManifestFileMeta {
                         deleteEntries.add(k);
                     }
                 });
-
+        //查找 base 中最早匹配的 manifest 文件
         List<ManifestEntry> mergedEntries = new ArrayList<>();
         for (; j < base.size(); j++) {
             ManifestFileMeta file = base.get(j);
@@ -341,7 +348,7 @@ public class ManifestFileMeta {
         }
 
         // 2.3. merge
-
+        //创建滚动的 writer，目前只能创建一个 writer 一是顺序写 二是 保证滚动写 满足文件大小
         RollingFileWriter<ManifestEntry, ManifestFileMeta> writer =
                 manifestFile.createRollingWriter();
         Exception exception = null;
@@ -351,7 +358,7 @@ public class ManifestFileMeta {
             for (ManifestEntry entry : mergedEntries) {
                 writer.write(entry);
             }
-
+            //将剩余的 base 中的 manifest 文件写一遍 其中进行 deleteEntries 判断，在 deleteEntries 中的文件就不再写入
             // 2.3.2 merge base files
             for (Supplier<List<ManifestEntry>> reader :
                     FileEntry.readManifestEntries(manifestFile, base.subList(j, base.size()))) {
@@ -362,7 +369,7 @@ public class ManifestFileMeta {
                     }
                 }
             }
-
+            //将 deltaMerged 为 add 类型的 manifestEntry 写出去
             // 2.3.3 merge deltaMerged
             for (ManifestEntry entry : deltaMerged.values()) {
                 if (entry.kind() == FileKind.ADD) {
@@ -380,7 +387,9 @@ public class ManifestFileMeta {
         }
 
         List<ManifestFileMeta> merged = writer.result();
+        //最终 result 包含两部分 一部分是 没有变动的 base 文件 一部分是新写入的 merged 文件
         result.addAll(merged);
+        //newMetas 中包含的都是新写入的文件
         newMetas.addAll(merged);
         return Optional.of(result);
     }
